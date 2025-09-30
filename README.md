@@ -16,6 +16,32 @@ To cite the preprint, use the following BibTeX entry:
 }
 ```
 
+## Example Plots: Distributionally Robust Optimization (DRO) with Unbalanced OT
+
+In one of the experiments, a small CNN is trained on MNIST dataset where 25% of train and validation labels are corrupted with feature-dependent noise (see [gorkemalgan/corrupting_labels_with_distillation](https://github.com/gorkemalgan/corrupting_labels_with_distillation/)). Test labels remain clean.
+
+We consider three training strategies:
+
+- **ERM (standard training on noisy data)**
+- **Baseline DRO: sum of exponents minimization**, see [Outlier-Robust DRO via Unbalanced OT](https://proceedings.neurips.cc/paper_files/paper/2024/hash/5d68a3f05ee2aae6a0fb2d94959082a0-Abstract-Conference.html)
+- **Proposed DRO approach with our LogSumExp approximation**
+
+<div style="display: flex; gap: 8px;">
+
+  <img src="uot-dro/plots/accuracy_erm.png" alt="ERM Accuracy" style="width: 32.5%;">
+
+  <img src="uot-dro/plots/accuracy.png" alt="DRO Accuracy" style="width: 29.8%;">
+
+  <img src="uot-dro/plots/loss.png" alt="Training Loss" style="width: 32.7%;">
+
+</div>
+
+**Key observations:**
+
+- **ERM overfits to noisy labels** — validation accuracy rises while test accuracy drops.
+- **Both DRO approaches generalize better**, preserving alignment between validation and test accuracy.
+- **The proposed approximation converges faster and more stably**, while the baseline is hindered by numerical issues unless a very small stepsize is used.
+
 ## System Information
 
 The following system was used to run all experiments in the paper:
