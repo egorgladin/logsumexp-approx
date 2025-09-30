@@ -1,3 +1,21 @@
+## About
+
+The paper ***Improved Stochastic Optimization of LogSumExp*** ([arxiv preprint](https://arxiv.org/abs/2509.24894)) introduces a LogSumExp approximation with tunable accuracy that can be efficiently optimized with stochastic methods.
+This repository contains the experiments described in the paper, covering distributionally robust optimization (DRO) and entropy-regularized continuous optimal transport problems.
+The experiments highlight numerical issues in existing LogSumExp optimization approaches and demonstrate how the proposed approximation addresses them, leading to superior performance.
+
+To cite the preprint, use the following BibTeX entry:
+```
+@misc{gladin2025logsumexp,
+  title={Improved Stochastic Optimization of LogSumExp},
+  author={Egor Gladin and Alexey Kroshnin and Jia-Jie Zhu and Pavel Dvurechensky},
+  year={2025},
+  eprint={2509.24894},
+  archivePrefix={arXiv},
+  url={https://arxiv.org/abs/2509.24894}
+}
+```
+
 ## System Information
 
 The following system was used to run all experiments in the paper:
