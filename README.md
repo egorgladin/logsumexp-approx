@@ -75,8 +75,8 @@ pip install -r requirements.txt
 ## Structure
 
 - Executing `python plot_f_rho.py` produces Figure 1 from the paper, i.e., plot of $f_{\rho}(t)$ for different values of $\rho$. 
-- Folders `eot`, `kl-dro` and `uot-dro` correspond to experiments in continuous entropy-regularized optimal transport, distributionally
-robust optimization (DRO) with KL divergence, and DRO with unbalanced optimal transport, respectively. To run each
+- Folders `neural_ot` and `eot` correspond to experiments in continuous entropy-regularized OT
+with neural network parameterization and RKHS, while folders `kl-dro` and `uot-dro` correspond to experiments in distributionally robust optimization (DRO) with KL divergence and with unbalanced optimal transport, respectively. To run each
 experiment, navigate to the dedicated folder and execute `python main.py`.
 - Depending on your setup, experiments may take from a few minutes
 up to **a few hours** due to repeated runs with different seeds.

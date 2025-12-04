@@ -1,4 +1,3 @@
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -7,6 +6,7 @@ import pickle
 from sklearn.datasets import fetch_california_housing
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LinearRegression
+import os
 
 
 def load_and_preprocess_data():
@@ -51,40 +51,45 @@ class LinearRegressionModel(nn.Module):
         return self.linear(x)
 
 
-def plot_convergence_bar(softplus_appr_param, batch_lse_param, seeds, show_ylabel=True):
-    labels = ["Proposed approach", "Batch LogSumExp approach"]
-    x_interest = np.array([20, 30, 40, 50])
-    plt.figure(figsize=(8, 8))
-    for lbl, (batch_sz, lr, rho) in zip(labels, [softplus_appr_param, batch_lse_param]):
-        curves = []
+def compute_final_objective_stats(data_tuples_lr, n_seeds=10, data_dir='trajectories'):
+    data_tuples_obj = []
 
-        for seed in seeds:
-            fname = 'batch_logsumexp' if rho is None else 'softplus_approx'
-            fname += f'_batch{batch_sz}_lr{lr}_rho{rho}_seed{seed}.pickle'
-            with open("trajectories/" + fname, "rb") as f:
-                xs, ys = pickle.load(f)
-            curves.append(ys)
+    for rho, lam, batch_sz, lr in data_tuples_lr:
+        final_objectives = []
 
-        curves = np.array(curves)
-        indices = [xs.index(x) for x in x_interest]
-        mean_vals = curves[:, indices].mean(axis=0)
-        std_vals = curves[:, indices].std(axis=0)
-        offset = 0.1 if lbl[0]=='P' else -0.1
-        plt.errorbar(x_interest + offset, mean_vals, yerr=std_vals, fmt='o-' if lbl[0]=='P' else 's-',
-                     capsize=7, lw=2, label=lbl)
+        for seed in range(n_seeds):
+            if rho is None:
+                fname = f'batch_logsumexp_lam{lam}_batch{batch_sz}_lr{lr}_rho{rho}_seed{seed}.pickle'
+            else:
+                fname = f'softplus_approx_lam{lam}_batch{batch_sz}_lr{lr}_rho{rho}_seed{seed}.pickle'
 
-    plt.xlabel("Epochs", fontsize=15)
-    plt.xticks(x_interest)
-    plt.grid(True, which="both")
+            filepath = os.path.join(data_dir, fname)
 
-    ax = plt.gca()
+            if os.path.exists(filepath):
+                try:
+                    with open(filepath, 'rb') as f:
+                        epochs_passed, logsumexp_vals = pickle.load(f)
 
-    if show_ylabel:
-        plt.ylabel("Objective value", fontsize=15)
-    else:
-        ax.set_yticklabels([])
-    plt.tick_params(axis='both', which='major', labelsize=15)
-    plt.ylim(0, 41)
-    plt.legend(fontsize=15)
-    plt.savefig(f"plots/batch{batch_lse_param[0]}.png", bbox_inches='tight', dpi=300)
-    plt.close()
+                    if len(logsumexp_vals) > 0:
+                        final_obj = logsumexp_vals[-1]
+                        final_objectives.append(final_obj)
+                    else:
+                        print(f"Warning: Empty trajectory in {fname}")
+
+                except Exception as e:
+                    print(f"Warning: Could not load {fname}: {e}")
+            else:
+                print(f"Warning: File {fname} not found")
+
+        if len(final_objectives) >= 2:
+            mean_final_obj = np.mean(final_objectives)
+            std_final_obj = np.std(final_objectives)
+            data_tuples_obj.append((rho, lam, batch_sz, mean_final_obj, std_final_obj))
+            print(f"Computed: rho={rho}, lam={lam}, B={batch_sz}, lr={lr}: "
+                  f"{len(final_objectives)}/{n_seeds} seeds, "
+                  f"mean={mean_final_obj:.4f}, std={std_final_obj:.4f}")
+        else:
+            print(f"Error: Insufficient data for rho={rho}, lam={lam}, B={batch_sz}, lr={lr}: "
+                  f"only {len(final_objectives)} seeds available")
+
+    return data_tuples_obj
