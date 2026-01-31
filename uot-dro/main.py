@@ -1,229 +1,280 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from tqdm import tqdm
-import random
-import pickle
 import math
 import os
 import numpy as np
+import urllib.request
+import random
+import json
+from tqdm import tqdm, trange
+import copy
 
-from utils import prepare_dataset, plot_results, format_number
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, TensorDataset
+
 from models import SimpleCNN
-from losses import inner_maximization, dro_loss, cross_entropy_loss
-import multiprocessing as mp
 
 
-def train(lam, rho, lr, seed, n_iters=int(1e5), n_checkpoints=10):
-    torch.manual_seed(seed)
-    random.seed(seed)
+def prepare_dataset():
+    train_path_cuda = "../data/train_set_cuda.pt"
+    val_path, test_path = "../data/val_set.pt", "../data/test_set.pt"
 
-    X_train_cpu, y_train_cpu = torch.load("train_set_cpu.pt")
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
 
-    model = SimpleCNN(with_alpha=rho is not None)
-    optimizer = optim.SGD(model.parameters(), lr=lr)
-    criterion_sum_reduction = nn.CrossEntropyLoss(reduction='sum')
-    criterion_no_reduction = None if lam is None else nn.CrossEntropyLoss(reduction='none')
+    # Load full training set (60k samples)
+    print("Donwloading MNIST (train and val)")
+    full_train_dataset = torchvision.datasets.MNIST(
+        root='../data/',
+        train=True,
+        download=False,
+        transform=transform
+    )
 
-    if lam is None:
-        objective = 'crossentropy'
-    else:
-        objective = 'sumexp' if rho is None else 'approx'
+    filename = "../data/feature-dependent_25_ytrain.npy"
+    if not os.path.exists(filename):
+        print("Donwloading noisy labels...", end=' ')
+        url = "https://github.com/gorkemalgan/corrupting_labels_with_distillation/raw/refs/heads/master/noisylabels/mnist/feature-dependent_25_ytrain.npy"
+        urllib.request.urlretrieve(url, filename)
+        print('Done.')
 
-    folder_name = f"trajectories/{objective}_weights_lr{lr:.0e}"
-    if objective == 'approx':
-        folder_name += f"_rho{rho}"
-    folder_name += f"_seed{seed}"
-    if not os.path.exists(folder_name):
-        os.makedirs(folder_name)
+    y_train_noisy = np.load(filename)
+    full_train_dataset.targets = y_train_noisy.tolist()
 
-    torch.save(model.state_dict(), folder_name + f"/0.pth")
+    # Split into train (50k) and validation (10k)
+    train_size = 50000
+    val_size = 10000
+    torch.manual_seed(42)
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_train_dataset,
+        [train_size, val_size]
+    )
 
-    loss_fn = cross_entropy_loss if objective == 'crossentropy' else dro_loss
+    # Load test set (10k samples)
+    test_dataset = torchvision.datasets.MNIST(
+        root='/kaggle/working',
+        train=False,
+        download=False,
+        transform=transform
+    )
 
-    save_every = n_iters // n_checkpoints
-    for step in range(1, n_iters + 1):
-        i = random.randint(0, len(y_train_cpu) - 1)
-        inputs, labels = X_train_cpu[i:i+1], y_train_cpu[i:i+1]
-        loss = loss_fn(model, inputs, labels, criterion_sum_reduction, criterion_no_reduction,
-                       lambda_=lam, rho=rho)
-        if loss is None:
-            print(f'    objective: {objective}, seed={seed}, iter {step}| Floating point exception occurred')
-            break
+    # Convert and save training set (50k)
+    X_train = torch.stack([img for img, _ in train_dataset])
+    y_train = torch.tensor([full_train_dataset.targets[i] for i in train_dataset.indices])
+    torch.save((X_train.to('cuda'), y_train.to('cuda')), train_path_cuda)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    # Convert and save validation set (10k)
+    X_val = torch.stack([img for img, _ in val_dataset]).to('cuda')
+    y_val = torch.tensor([full_train_dataset.targets[i] for i in val_dataset.indices]).to('cuda')
+    torch.save((X_val, y_val), val_path)
 
-        if step == save_every // 2 or step % save_every == 0:
-            print(f'    objective: {objective}, seed={seed} | iter {format_number(step)}/{format_number(n_iters)}')
-            torch.save(model.state_dict(),
-                       folder_name + f"/{step}.pth")
+    # Convert and save test set (10k)
+    X_test = torch.stack([img for img, _ in test_dataset]).to('cuda')
+    y_test = torch.tensor([label for _, label in test_dataset]).to('cuda')
+    torch.save((X_test, y_test), test_path)
 
 
-def eval_loss(model, cuda_loader, lam, cross_entropy_sum_reduction, cross_entropy_no_reduction):
+def inner_maximization(model, criterion, X, y, lam, lr=None, momentum=0.4, n_steps=5):
     if lam is None:
         lam = 1.
+    if lr is None:
+        lr = 0.1 / lam
+    U = X.clone().requires_grad_(True)
+    v = torch.zeros_like(U)
 
+    for step in range(n_steps):
+        U_ahead = U + momentum * v
+        preds = model(U_ahead)
+        if torch.isnan(preds).any() or torch.isinf(preds).any():
+            return None
+
+        loss = criterion(preds, y) - lam * (X - U).pow(2).sum()
+        grad, = torch.autograd.grad(loss, U, create_graph=False)
+        v = momentum * v + lr * grad
+        with torch.no_grad():
+            U += v
+
+    return U.detach()
+
+
+def dro_loss(model, X, y, ce_sum_reduction, ce_no_reduction, lam_beta=1., lam=1., rho=0.1):
+    model.freeze_weights()
+    U_star = inner_maximization(model, ce_sum_reduction, X, y, lam)
+    model.unfreeze_weights()
+    if U_star is None:
+        return None, None
+
+    preds = model(U_star)
+    losses = ce_no_reduction(preds, y)
+    costs = (X - U_star).pow(2).sum(dim=(1, 2, 3))
+    exponent = losses - lam * costs
+    if rho is None:
+        total = torch.exp(exponent / lam_beta).mean()
+    else:
+        adjusted_exponent = (exponent - model.alpha) / lam_beta + math.log(rho)
+        total = (lam_beta / rho) * F.softplus(adjusted_exponent).mean() + model.alpha
+    return total, exponent
+
+
+def eval_loss(model, cuda_loader, lam_beta, lam, ce_sum_reduction, ce_no_reduction):
     model.freeze_weights().eval()
     exponents = []
     for X, y in cuda_loader:
-        U_star = inner_maximization(model, cross_entropy_sum_reduction, X, y, lam)
+        U_star = inner_maximization(model, ce_sum_reduction, X, y, lam)
         preds = model(U_star)
-        losses = cross_entropy_no_reduction(preds, y)
+        losses = ce_no_reduction(preds, y)
         costs = (X - U_star).pow(2).sum(dim=(1, 2, 3))
         exponents.append(losses - lam * costs)
 
     exponents = torch.cat(exponents)
-    total_loss = lam * torch.logsumexp(exponents / lam, dim=0) - math.log(len(exponents))
+    objective = lam_beta * torch.logsumexp(exponents / lam_beta, dim=0) \
+                - lam_beta * math.log(len(exponents))
 
     model.unfreeze_weights().train()
-    return total_loss.item()
+    return objective.item()
 
 
-def eval_accuracy(model, loader):
-    model.eval().to('cuda')
-    correct = total = 0
-    with torch.no_grad():
-        for inputs, labels in loader:
-            outputs = model(inputs)
-            preds = outputs.argmax(dim=1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
-    return 100 * correct / total
+def train(lam_beta, lam, rho, lr, seed, batch_sz=64, n_epochs=20, save_weights=False, extra_checkpoints=[]):
+    torch.manual_seed(seed)
+    random.seed(seed)
 
-
-def trajectory_to_metrics(lr, lam, rho, seeds, eval_batch_size=2000):
-    X_train_cuda, y_train_cuda = torch.load("train_set_cuda.pt")
-    X_val, y_val = torch.load("val_set.pt")
-    X_test, y_test = torch.load("test_set.pt")
-    train_loader_cuda = DataLoader(TensorDataset(X_train_cuda, y_train_cuda),
-                                   batch_size=eval_batch_size,
-                                   shuffle=False)
-    val_loader = DataLoader(TensorDataset(X_val, y_val),
-                            batch_size=eval_batch_size,
-                            shuffle=False)
-    test_loader = DataLoader(TensorDataset(X_test, y_test),
-                             batch_size=eval_batch_size,
-                             shuffle=False)
-
-    criterion_sum_reduction = nn.CrossEntropyLoss(reduction='sum')
-    criterion_no_reduction = nn.CrossEntropyLoss(reduction='none')
-
-    if lam is None:
-        objective = 'crossentropy'
-    else:
-        objective = 'sumexp' if rho is None else 'approx'
+    X_train_cuda, y_train_cuda = torch.load("../data/train_set_cuda.pt")
+    cuda_loader = DataLoader(TensorDataset(X_train_cuda, y_train_cuda),
+                             batch_size=batch_sz, shuffle=True)
 
     model = SimpleCNN(with_alpha=rho is not None).cuda()
+    optimizer = optim.SGD(model.parameters(), lr=lr)
+    ce_sum_reduction = nn.CrossEntropyLoss(reduction='sum')
+    ce_no_reduction = nn.CrossEntropyLoss(reduction='none')
 
-    folder_name_prefix = f"trajectories/{objective}_weights_lr{lr:.0e}"
-    if rho:
-        folder_name_prefix += f"_rho{rho}"
+    state_dicts = []
+    if save_weights:
+        state_dicts.append(copy.deepcopy(model.state_dict()))
 
-    loss_curves = []
-    val_acc_curves = []
-    test_acc_curves = []
-    for seed in seeds:
-        losses_fname = f'trajectories/{objective}_loss_lr{lr:.0e}_seed{seed}.pickle'
-        val_acc_fname = f'trajectories/{objective}_val_acc_lr{lr:.0e}_seed{seed}.pickle'
-        test_acc_fname = f'trajectories/{objective}_test_acc_lr{lr:.0e}_seed{seed}.pickle'
-        if rho:
-            losses_fname = f'trajectories/{objective}_loss_lr{lr:.0e}_rho{rho}_seed{seed}.pickle'
-            val_acc_fname = f'trajectories/{objective}_val_acc_lr{lr:.0e}_rho{rho}_seed{seed}.pickle'
-            test_acc_fname = f'trajectories/{objective}_test_acc_lr{lr:.0e}_rho{rho}_seed{seed}.pickle'
+    for epoch in trange(n_epochs):
+        for i, (X, y) in enumerate(cuda_loader):
+            if save_weights and (epoch == 0) and (i in extra_checkpoints):
+                state_dicts.append(copy.deepcopy(model.state_dict()))
+            loss, exponent = dro_loss(model, X, y, ce_sum_reduction, ce_no_reduction,
+                                      lam_beta=lam_beta, lam=lam, rho=rho)
+            if loss is None:
+                print('Floating point exception')
+                return state_dicts if save_weights else None
 
-        if (os.path.exists(losses_fname) and os.path.exists(val_acc_fname)
-                and os.path.exists(test_acc_fname)):
-            with (open(losses_fname, "rb") as f1, open(val_acc_fname, "rb") as f2,
-                  open(test_acc_fname, "rb") as f3):
-                iter_numbers, losses = pickle.load(f1)
-                iter_numbers, accs_val = pickle.load(f2)
-                iter_numbers, accs_test = pickle.load(f3)
-        else:
-            losses, accs_val, accs_test = [], [], []
-            iter_numbers = []
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-            folder_name = folder_name_prefix + f"_seed{seed}"
-            weights_files = [(f, int(f.split('.')[0])) for f in os.listdir(folder_name)]
-            weights_files.sort(key=lambda x: x[1])
+        if save_weights:
+            state_dicts.append(copy.deepcopy(model.state_dict()))
 
-            for f, i in tqdm(weights_files):
-                state_dict = torch.load(os.path.join(folder_name, f))
-                model.load_state_dict(state_dict)
-                loss = None if objective == 'crossentropy'\
-                    else eval_loss(model, train_loader_cuda, lam, criterion_sum_reduction, criterion_no_reduction)
-                losses.append(loss)
-                accs_val.append(eval_accuracy(model, val_loader))
-                accs_test.append(eval_accuracy(model, test_loader))
-                iter_numbers.append(i)
+    if save_weights:
+        return state_dicts
 
-            with (open(losses_fname, "wb") as f1, open(val_acc_fname, "wb") as f2,
-                  open(test_acc_fname, "wb") as f3):
-                pickle.dump((iter_numbers, losses), f1)
-                pickle.dump((iter_numbers, accs_val), f2)
-                pickle.dump((iter_numbers, accs_test), f3)
-
-        loss_curves.append(losses)
-        val_acc_curves.append(accs_val)
-        test_acc_curves.append(accs_test)
-
-    loss_curves = np.array(loss_curves)
-    loss_mean = None if objective == 'crossentropy' else loss_curves.mean(axis=0)
-    loss_std = None if objective == 'crossentropy' else loss_curves.std(axis=0)
-
-    val_curves = np.array(val_acc_curves)
-    val_mean = val_curves.mean(axis=0)
-    val_std = val_curves.std(axis=0)
-
-    test_curves = np.array(test_acc_curves)
-    test_mean = test_curves.mean(axis=0)
-    test_std = test_curves.std(axis=0)
-
-    res = {
-        'loss': (iter_numbers, loss_mean, loss_std),
-        'val_acc': (iter_numbers, val_mean, val_std),
-        'test_acc': (iter_numbers, test_mean, test_std)
-    }
-
-    return objective, res
-
-
-def main():
-    if not os.path.exists('trajectories'):
-        os.makedirs('trajectories')
-
-    prepare_dataset()
-
-    param_grid = [  # (lam, rho, lr)
-        (1., 0.1, 1e-4),
-        (1., None, 1e-5),  # rho==None corresponds to SumExp approach (if lam is not None)
-        (None, None, 1e-3)  # lam==None corresponds to ERM
-    ]
-    seeds = list(range(10))
-    tasks = [(lam, rho, lr, seed)
-             for lam, rho, lr in param_grid
-             for seed in seeds]
-
-    print("Running experiments (in parallel)")
-    with mp.Pool(processes=3) as pool:
-        pool.starmap(train, tasks)
-    print("Finished experiment runs.")
-
-    print("Computing loss and accuracy for the generated trajectories")
-    seeds_for_sumexp = [s for s in seeds if s != 8]
-    results = dict()
-    for lam, rho, lr in param_grid:
-        is_sumexp = rho is None and lam is not None
-        seeds_ = seeds_for_sumexp if is_sumexp else seeds
-        objective, res = trajectory_to_metrics(lr, lam, rho, seeds_)
-        results[objective] = res
-    print("Loss and accuracy have been computed.")
-
-    plot_results(results)
-    print("Plots have been created.")
+    obj_val = eval_loss(model, cuda_loader, lam_beta, lam, ce_sum_reduction, ce_no_reduction)
+    return obj_val
 
 
 if __name__ == '__main__':
-    main()
+    param_grid = [ # (lam_beta, lam, rho, lr)
+        ### lam_beta = 1/5 ###
+        (.2, .2, None, 1e-9),
+        (.2, .2, 0.01, 1e-2),
+        (.2, .2, 0.1 , 1e-2),
+        (.2, .2, 1.  , 1e-2),
+
+        (.2, 1., None, 1e-9),
+        (.2, 1., 0.01, 1e-2),
+        (.2, 1., 0.1 , 1e-2),
+        (.2, 1., 1.  , 1e-2),
+
+        (.2, 5., None, 1e-9),
+        (.2, 5., 0.01, 1e-3),
+        (.2, 5., 0.1 , 1e-2),
+        (.2, 5., 1.  , 1e-2),
+
+        ### lam_beta = 1 ###
+        (1., .2, None, 1e-4),
+        (1., .2, 0.01, 1e-2),
+        (1., .2, 0.1 , 1e-2),
+        (1., .2, 1.  , 1e-1),
+
+        (1., 1., None, 1e-4),
+        (1., 1., 0.01, 1e-2),
+        (1., 1., 0.1 , 1e-2),
+        (1., 1., 1.  , 1e-1),
+
+        (1., 5., None, 1e-4),
+        (1., 5., 0.01, 1e-2),
+        (1., 5., 0.1 , 1e-2),
+        (1., 5., 1.  , 1e-1),
+
+        ### lam_beta = 5 ###
+        (5., .2, None, 1.  ),
+        (5., .2, 0.01, 1e-1),
+        (5., .2, 0.1 , 1e-1),
+        (5., .2, 1.  , 1e-1),
+
+        (5., 1., None, 1.  ),
+        (5., 1., 0.01, 1e-1),
+        (5., 1., 0.1 , 1e-1),
+        (5., 1., 1.  , 1e-1),
+
+        (5., 5., None, 1e-1),
+        (5., 5., 0.01, 1e-2),
+        (5., 5., 0.1 , 1e-1),
+        (5., 5., 1.  , 1e-1)
+    ]
+    seeds = list(range(5))
+
+    # Computations for Table 2 in the paper
+    print("Writing results to results.jsonl")
+    with open("results.jsonl", "a") as f:
+        for lam_beta, lam, rho, lr in param_grid:
+            for seed in seeds:
+                obj_val = train(lam_beta, lam, rho, lr, seed)
+                if obj_val is None:
+                    break
+
+                record = {
+                    "lam_beta": lam_beta,
+                    "lam": lam,
+                    "rho": rho,
+                    "lr": lr,
+                    "seed": seed,
+                    "obj_val": obj_val,
+                }
+
+                f.write(json.dumps(record) + "\n")
+                f.flush()
+
+    print("Computing objective values for Figure 3 in the paper")
+    lam_beta, lam = 1., 1.
+    seed = 2
+    X_train_cuda, y_train_cuda = torch.load("../data/train_set_cuda.pt")
+    cuda_loader = DataLoader(TensorDataset(X_train_cuda, y_train_cuda),
+                             batch_size=1000, shuffle=True)
+    ce_sum_reduction = nn.CrossEntropyLoss(reduction='sum')
+    ce_no_reduction = nn.CrossEntropyLoss(reduction='none')
+
+    for rho, lr in [(None, 1e-4), (0.1, 1e-2), (None, 1e-3)]:
+        if lr in [1e-4, 1e-2]:
+            print("Baseline:" if rho is None else "Proposed approach:")
+            state_dicts = train(lam_beta, lam, rho, lr, seed, save_weights=True)
+        else:
+            print("Baseline with larger lr (overflow is expected during iteration #615, but that may depend on your system):")
+            state_dicts = train(lam_beta, lam, rho, lr, seed,
+                                save_weights=True, extra_checkpoints=[300, 600, 610, 611, 612, 613, 614])
+
+        model = SimpleCNN(with_alpha=rho is not None).cuda()
+        losses = []
+        for weights in tqdm(state_dicts):
+            model.load_state_dict(weights)
+            obj_val = eval_loss(model, cuda_loader, lam_beta, lam, ce_sum_reduction, ce_no_reduction)
+            losses.append(obj_val)
+        print(losses)

@@ -18,29 +18,14 @@ To cite the preprint, use the following BibTeX entry:
 
 ## Example Plots: Distributionally Robust Optimization (DRO) with Unbalanced OT
 
-In one of the experiments, a small CNN is trained on MNIST dataset where 25% of train and validation labels are corrupted with feature-dependent noise (see [gorkemalgan/corrupting_labels_with_distillation](https://github.com/gorkemalgan/corrupting_labels_with_distillation/)). Test labels remain clean.
+In one of the experiments, a small CNN is trained on MNIST with [noisy labels](https://github.com/gorkemalgan/corrupting_labels_with_distillation/).
+DRO with unbalanced OT results in a LogSumExp-type objective, which we optimize using our proposed approach and a [baseline](https://proceedings.neurips.cc/paper_files/paper/2024/hash/5d68a3f05ee2aae6a0fb2d94959082a0-Abstract-Conference.html).
 
-We consider three training strategies:
+On the figure below, the proposed approach (orange) minimizes the objective using a relatively large learning rate of $10^{-2}$.
+The baseline (blue), however, requires a learning rate of $10^{-4}$ to avoid numerical overflow, as demonstrated by its rapid divergence (green dashed curve) for $\text{lr}=10^{-3}$. Consequently, the proposed method achieves lower objective values, while the baseline's small learning rate results in slow progress.
 
-- **ERM (standard training on noisy data)**
-- **Baseline DRO: sum of exponents minimization**, see [Outlier-Robust DRO via Unbalanced OT](https://proceedings.neurips.cc/paper_files/paper/2024/hash/5d68a3f05ee2aae6a0fb2d94959082a0-Abstract-Conference.html)
-- **Proposed DRO approach with our LogSumExp approximation**
+![loss curves example](/uot-dro/loss_curves_example.png)
 
-<div style="display: flex; gap: 8px;">
-
-  <img src="uot-dro/plots/accuracy_erm.png" alt="ERM Accuracy" style="width: 32.5%;">
-
-  <img src="uot-dro/plots/accuracy.png" alt="DRO Accuracy" style="width: 29.8%;">
-
-  <img src="uot-dro/plots/loss.png" alt="Training Loss" style="width: 32.7%;">
-
-</div>
-
-**Key observations:**
-
-- **ERM overfits to noisy labels** — validation accuracy rises while test accuracy drops.
-- **Both DRO approaches generalize better**, preserving alignment between validation and test accuracy.
-- **The proposed approximation converges faster and more stably**, while the baseline is hindered by numerical issues unless a very small stepsize is used.
 
 ## System Information
 
